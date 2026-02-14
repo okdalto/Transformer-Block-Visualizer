@@ -1,0 +1,283 @@
+import ctypes
+import math
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from OpenGL import GL as gl
+from core.shader import ShaderProgram
+
+
+STAGE_DISPLAY_NAMES = {
+    'input':              'Input Embeddings',
+    'qkv_projection':     'QKV Projection',
+    'multi_head_attn':    'Multi-Head Attention',
+    'concat_output_proj': 'Concat + Output Projection',
+    'residual_ln1':       'Residual + LayerNorm 1',
+    'ffn':                'Feed-Forward Network',
+    'residual_ln2':       'Residual + LayerNorm 2',
+    'output':             'Output',
+}
+
+MAX_CHARS = 256
+
+
+class TextRenderer:
+    def __init__(self, vert_path: str, frag_path: str, font_size: int = 32):
+        self.shader = ShaderProgram(vert_path, frag_path)
+        self.font_size = font_size
+        self._build_font_atlas(font_size)
+        self._setup_gl()
+
+    def _build_font_atlas(self, font_size: int):
+        font = ImageFont.load_default(size=font_size)
+
+        # Use font metrics for cell height (ascent + descent covers all glyphs)
+        chars = [chr(c) for c in range(32, 127)]
+        ascent, descent = font.getmetrics()
+
+        max_w = 0
+        for ch in chars:
+            bbox = font.getbbox(ch)
+            max_w = max(max_w, bbox[2] - bbox[0])
+
+        pad = 4
+        self.cell_w = max_w + pad
+        self.cell_h = ascent + descent + pad
+        cols = math.ceil(math.sqrt(len(chars)))
+        rows = math.ceil(len(chars) / cols)
+
+        atlas_w = cols * self.cell_w
+        atlas_h = rows * self.cell_h
+        img = Image.new('L', (atlas_w, atlas_h), 0)
+        draw = ImageDraw.Draw(img)
+
+        self.char_info = {}  # char -> (u0, v0, u1, v1, advance_px)
+        for idx, ch in enumerate(chars):
+            col = idx % cols
+            row = idx // cols
+            x = col * self.cell_w + pad // 2
+            y = row * self.cell_h + pad // 2
+            # anchor='la' positions at left-ascender for consistent baseline
+            draw.text((x, y), ch, fill=255, font=font, anchor='la')
+
+            bbox = font.getbbox(ch)
+            advance = bbox[2] - bbox[0] + 1
+
+            u0 = x / atlas_w
+            v0 = y / atlas_h
+            u1 = (x + self.cell_w - pad) / atlas_w
+            v1 = (y + self.cell_h - pad) / atlas_h
+            self.char_info[ch] = (u0, v0, u1, v1, advance)
+
+        # Reserve a solid-white 1x1 pixel at top-left corner for background quads
+        img.putpixel((0, 0), 255)
+        self.solid_uv = (0.5 / atlas_w, 0.5 / atlas_h)
+
+        # Flip vertically for OpenGL (origin at bottom-left)
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        atlas_data = np.ascontiguousarray(np.array(img, dtype=np.uint8))
+
+        # After vertical flip, the solid pixel moves from top-left to bottom-left
+        self.solid_uv = (0.5 / atlas_w, 1.0 - 0.5 / atlas_h)
+
+        # Upload to GPU - must set alignment to 1 for single-channel textures
+        self.atlas_texture = gl.glGenTextures(1)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.atlas_texture)
+        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D, 0, gl.GL_R8,
+            atlas_w, atlas_h, 0,
+            gl.GL_RED, gl.GL_UNSIGNED_BYTE, atlas_data
+        )
+        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 4)  # restore default
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+        self.atlas_w = atlas_w
+        self.atlas_h = atlas_h
+
+    def _setup_gl(self):
+        self.vao = gl.glGenVertexArrays(1)
+        gl.glBindVertexArray(self.vao)
+
+        self.vbo = gl.glGenBuffers(1)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glBufferData(
+            gl.GL_ARRAY_BUFFER,
+            MAX_CHARS * 6 * 4 * 4,  # 6 verts * 4 floats * 4 bytes
+            None, gl.GL_DYNAMIC_DRAW
+        )
+
+        stride = 4 * 4  # 16 bytes
+        gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(0, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(1)
+        gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(8))
+
+        gl.glBindVertexArray(0)
+
+    def destroy(self):
+        gl.glDeleteBuffers(1, [self.vbo])
+        gl.glDeleteVertexArrays(1, [self.vao])
+        gl.glDeleteTextures(1, [self.atlas_texture])
+        self.shader.destroy()
+
+    def _ortho_2d(self, width: float, height: float) -> np.ndarray:
+        m = np.zeros((4, 4), dtype=np.float32)
+        m[0, 0] = 2.0 / width
+        m[1, 1] = 2.0 / height
+        m[0, 3] = -1.0
+        m[1, 3] = -1.0
+        m[3, 3] = 1.0
+        return m
+
+    def _build_quads(self, text: str, x: float, y: float):
+        verts = []
+        cx = x
+        for ch in text:
+            info = self.char_info.get(ch)
+            if info is None:
+                info = self.char_info.get(' ')
+                if info is None:
+                    continue
+            u0, v0_atlas, u1, v1_atlas = info[0], info[1], info[2], info[3]
+            advance = info[4]
+
+            # Flip V coords since atlas was flipped
+            v0 = 1.0 - v1_atlas
+            v1 = 1.0 - v0_atlas
+
+            x0 = cx
+            y0 = y
+            x1 = cx + self.cell_w - 2
+            y1 = y + self.cell_h - 2
+
+            # Two triangles per character quad
+            verts.extend([
+                x0, y0, u0, v0,
+                x1, y0, u1, v0,
+                x1, y1, u1, v1,
+                x0, y0, u0, v0,
+                x1, y1, u1, v1,
+                x0, y1, u0, v1,
+            ])
+            cx += advance
+
+        return np.array(verts, dtype=np.float32), len(text) * 6
+
+    def render_text(self, text: str, x: float, y: float,
+                    fb_width: int, fb_height: int,
+                    color=(1.0, 1.0, 1.0, 1.0),
+                    depth=None):
+        """Render text at screen position.
+
+        Args:
+            depth: If provided (0..1), enable depth testing and write this
+                   depth value so labels can be occluded by 3D geometry.
+                   If None, render as a 2D overlay (no depth test).
+        """
+        if not text:
+            return
+
+        vertex_data, num_verts = self._build_quads(text, x, y)
+        if num_verts == 0:
+            return
+
+        proj = self._ortho_2d(fb_width, fb_height)
+
+        prev_depth_test = gl.glIsEnabled(gl.GL_DEPTH_TEST)
+        if depth is not None:
+            gl.glEnable(gl.GL_DEPTH_TEST)
+            gl.glDepthMask(gl.GL_FALSE)  # read-only: don't write to depth buffer
+        else:
+            gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+
+        self.shader.use()
+        self.shader.set_mat4("u_projection", proj)
+        self.shader.set_int("u_font_atlas", 0)
+        self.shader.set_vec4("u_text_color", np.array(color, dtype=np.float32))
+        self.shader.set_float("u_depth", depth if depth is not None else -1.0)
+
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.atlas_texture)
+
+        gl.glBindVertexArray(self.vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, vertex_data.nbytes, vertex_data)
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, num_verts)
+        gl.glBindVertexArray(0)
+
+        if depth is not None:
+            gl.glDepthMask(gl.GL_TRUE)  # restore depth writing
+        if prev_depth_test:
+            gl.glEnable(gl.GL_DEPTH_TEST)
+        else:
+            gl.glDisable(gl.GL_DEPTH_TEST)
+
+    def _measure_text(self, text: str) -> float:
+        width = 0.0
+        for ch in text:
+            info = self.char_info.get(ch, self.char_info.get(' '))
+            if info:
+                width += info[4]
+        return width
+
+    def render_stage_name(self, stage_name: str, fb_width: int, fb_height: int):
+        display_name = STAGE_DISPLAY_NAMES.get(stage_name, stage_name)
+        text_width = self._measure_text(display_name)
+
+        padding = 20
+        x = fb_width - text_width - padding
+        y = padding
+
+        # Semi-transparent dark background
+        bg_x = x - 10
+        bg_y = y - 6
+        bg_w = text_width + 20
+        bg_h = self.cell_h + 4
+        self._render_bg_quad(bg_x, bg_y, bg_w, bg_h, fb_width, fb_height,
+                             color=(0.0, 0.0, 0.0, 0.6))
+
+        # White text
+        self.render_text(display_name, x, y, fb_width, fb_height,
+                         color=(1.0, 1.0, 1.0, 0.95))
+
+    def _render_bg_quad(self, x: float, y: float, w: float, h: float,
+                        fb_width: int, fb_height: int,
+                        color=(0.0, 0.0, 0.0, 0.6)):
+        # Use the solid-white pixel UV so the quad is fully opaque in the atlas
+        su, sv = self.solid_uv
+
+        verts = np.array([
+            x, y, su, sv,
+            x + w, y, su, sv,
+            x + w, y + h, su, sv,
+            x, y, su, sv,
+            x + w, y + h, su, sv,
+            x, y + h, su, sv,
+        ], dtype=np.float32)
+
+        proj = self._ortho_2d(fb_width, fb_height)
+
+        prev_depth = gl.glIsEnabled(gl.GL_DEPTH_TEST)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+
+        self.shader.use()
+        self.shader.set_mat4("u_projection", proj)
+        self.shader.set_int("u_font_atlas", 0)
+        self.shader.set_vec4("u_text_color", np.array(color, dtype=np.float32))
+
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.atlas_texture)
+
+        gl.glBindVertexArray(self.vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, 6)
+        gl.glBindVertexArray(0)
+
+        if prev_depth:
+            gl.glEnable(gl.GL_DEPTH_TEST)
