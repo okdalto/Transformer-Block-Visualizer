@@ -6,7 +6,9 @@ An interactive 3D visualization of a Transformer encoder block, built with Pytho
 ![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-green)
 
 <p align="center">
-  <img src="assets/hero.jpg" alt="Transformer Block Visualizer — Multi-Head Attention" width="720">
+  <video src="https://github.com/user-attachments/assets/1f1d0d02-8fe7-4012-a836-3d8b62d2ef99" width="720" autoplay loop muted>
+    Your browser does not support the video tag.
+  </video>
 </p>
 
 ## What It Shows
