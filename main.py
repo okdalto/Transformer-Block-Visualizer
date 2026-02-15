@@ -44,8 +44,8 @@ def parse_args():
 def setup(args):
     """Create window, shaders, scene. Returns (app, scene, box_shader, text_renderer, label_renderer)."""
     if args.record:
-        w, h = args.width, args.height
-        title = f"Recording {w}x{h} @ {args.fps}fps..."
+        w, h = 640, 360  # small context window; actual rendering via offscreen FBO
+        title = f"Recording {args.width}x{args.height} @ {args.fps}fps..."
     else:
         w, h = 1600, 900
         title = "Transformer Block Visualizer"
@@ -72,7 +72,11 @@ def setup(args):
     transformer = TransformerBlock(config)
     x = np.random.RandomState(123).randn(config.seq_len, config.d_model).astype(np.float32) * 0.5
     results = transformer.forward(x)
-    aspect = w / max(h, 1)
+    if args.record:
+        aspect = args.width / max(args.height, 1)
+    else:
+        fb_w, fb_h = app.get_framebuffer_size()
+        aspect = fb_w / max(fb_h, 1)
     scene = Scene(results, config, box_shader, aspect=aspect)
 
     gl.glEnable(gl.GL_DEPTH_TEST)
@@ -105,6 +109,76 @@ def read_pixels(fb_w, fb_h, target_w, target_h):
     if fb_w > target_w:
         img = img.resize((target_w, target_h), Image.LANCZOS)
     return img
+
+
+def create_offscreen_fbo(width, height, samples=4):
+    """Create MSAA offscreen framebuffer for exact-resolution recording."""
+    msaa_fbo = gl.glGenFramebuffers(1)
+    gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, msaa_fbo)
+
+    msaa_color = gl.glGenRenderbuffers(1)
+    gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, msaa_color)
+    gl.glRenderbufferStorageMultisample(
+        gl.GL_RENDERBUFFER, samples, gl.GL_RGBA8, width, height)
+    gl.glFramebufferRenderbuffer(
+        gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0,
+        gl.GL_RENDERBUFFER, msaa_color)
+
+    msaa_depth = gl.glGenRenderbuffers(1)
+    gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, msaa_depth)
+    gl.glRenderbufferStorageMultisample(
+        gl.GL_RENDERBUFFER, samples, gl.GL_DEPTH_COMPONENT24, width, height)
+    gl.glFramebufferRenderbuffer(
+        gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT,
+        gl.GL_RENDERBUFFER, msaa_depth)
+
+    status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
+    if status != gl.GL_FRAMEBUFFER_COMPLETE:
+        raise RuntimeError(f"MSAA FBO incomplete: {status:#x}")
+
+    resolve_fbo = gl.glGenFramebuffers(1)
+    gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, resolve_fbo)
+
+    resolve_color = gl.glGenRenderbuffers(1)
+    gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, resolve_color)
+    gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_RGBA8, width, height)
+    gl.glFramebufferRenderbuffer(
+        gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0,
+        gl.GL_RENDERBUFFER, resolve_color)
+
+    status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
+    if status != gl.GL_FRAMEBUFFER_COMPLETE:
+        raise RuntimeError(f"Resolve FBO incomplete: {status:#x}")
+
+    gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+    return {
+        'msaa': msaa_fbo, 'resolve': resolve_fbo,
+        'w': width, 'h': height,
+        '_rbs': (msaa_color, msaa_depth, resolve_color),
+    }
+
+
+def fbo_read_pixels(fbo):
+    """Resolve MSAA and read pixels from offscreen FBO."""
+    w, h = fbo['w'], fbo['h']
+    gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, fbo['msaa'])
+    gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, fbo['resolve'])
+    gl.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
+                         gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST)
+    gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo['resolve'])
+    gl.glFinish()
+    pixels = gl.glReadPixels(0, 0, w, h, gl.GL_RGB, gl.GL_UNSIGNED_BYTE)
+    gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+    img = Image.frombytes("RGB", (w, h), pixels)
+    return img.transpose(Image.FLIP_TOP_BOTTOM)
+
+
+def destroy_fbo(fbo):
+    """Clean up offscreen FBO resources."""
+    for fb in (fbo['msaa'], fbo['resolve']):
+        gl.glDeleteFramebuffers(1, [fb])
+    for rb in fbo['_rbs']:
+        gl.glDeleteRenderbuffers(1, [rb])
 
 
 def run_interactive(args):
@@ -181,6 +255,7 @@ def run_interactive(args):
 
 def run_record(args):
     app, scene, box_shader, text_renderer, label_renderer = setup(args)
+    fbo = create_offscreen_fbo(args.width, args.height)
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     out_dir = args.output_dir or os.path.join(base_dir, "recordings")
@@ -193,13 +268,12 @@ def run_record(args):
     loop_duration = scene.timeline.total_duration + scene.timeline.return_duration
     sim_dt = args.speed / args.fps
     total_frames = int(loop_duration * args.fps / args.speed)
+    fb_w, fb_h = fbo['w'], fbo['h']
 
     print(f"=== Recording: {total_frames} frames @ {args.fps}fps (speed={args.speed}x) ===")
     print(f"  Duration : {loop_duration:.1f}s (animation {scene.timeline.total_duration:.1f}s + return {scene.timeline.return_duration:.1f}s)")
     print(f"  Output   : {out_dir}/frame_XXXXX.{ext}")
-
-    fb_w, fb_h = app.get_framebuffer_size()
-    print(f"  Size     : {args.width}x{args.height} (fb {fb_w}x{fb_h})")
+    print(f"  Size     : {fb_w}x{fb_h} (offscreen FBO)")
     print()
 
     # Warm up: advance scene to t=0 so camera/visuals initialize
@@ -210,8 +284,10 @@ def run_record(args):
         scene.timeline.current_time = (i * sim_dt) % loop_duration
         scene.update(0.0)
 
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo['msaa'])
+        gl.glViewport(0, 0, fb_w, fb_h)
         stage = render_frame(scene, text_renderer, label_renderer, fb_w, fb_h)
-        img = read_pixels(fb_w, fb_h, args.width, args.height)
+        img = fbo_read_pixels(fbo)
 
         frame_path = os.path.join(out_dir, f"frame_{i:05d}.{ext}")
         img.save(frame_path, **save_kwargs)
@@ -235,6 +311,7 @@ def run_record(args):
     x = np.random.RandomState(123).randn(config.seq_len, config.d_model).astype(np.float32) * 0.5
     results = transformer.forward(x)
 
+    destroy_fbo(fbo)
     scene.renderer.destroy()
     box_shader.destroy()
     text_renderer.destroy()
