@@ -530,11 +530,13 @@ class Scene:
             return [(v.origin, rows, cols, v.sp, v.bs)]
         return []
 
-    def _compute_stage_view_bounds(self, stage_name, cam_right, cam_up):
+    def _compute_stage_view_bounds(self, stage_name, cam_right, cam_up,
+                                   group=None):
         """Compute tight bounding box in view space (cam_right / cam_up).
 
         Projects each visual's actual corner points into view space,
         giving tighter bounds than projecting world-AABB corners.
+        If group is specified, only include visuals of that phase_group.
         Returns (vx_min, vx_max, vy_min, vy_max).
         """
         stage = self.stages[stage_name]
@@ -544,6 +546,8 @@ class Scene:
         vy_max = -np.inf
 
         for v in stage.visuals:
+            if group is not None and getattr(v, 'phase_group', 0) != group:
+                continue
             for origin, rows, cols, sp, bs in self._get_visual_extents(v):
                 x0 = origin[0] - bs / 2
                 x1 = origin[0] + (cols - 1) * sp + bs / 2
@@ -588,11 +592,12 @@ class Scene:
 
         cam_dist = 200.0
         assumed_aspect = self.aspect
-        margin = 2.0  # fixed view-space margin (same for every stage)
+        margin = 3.5  # fixed view-space margin (same for every stage)
 
-        def compute_framing(stage_name):
+        def compute_framing(stage_name, group=None):
             vx_min, vx_max, vy_min, vy_max = \
-                self._compute_stage_view_bounds(stage_name, cam_right, cam_up)
+                self._compute_stage_view_bounds(stage_name, cam_right, cam_up,
+                                                group=group)
 
             # View-space center → world-space target
             vcx = (vx_min + vx_max) / 2.0
@@ -601,6 +606,8 @@ class Scene:
             stage = self.stages[stage_name]
             fwd_sum, fwd_cnt = 0.0, 0
             for v in stage.visuals:
+                if group is not None and getattr(v, 'phase_group', 0) != group:
+                    continue
                 for origin, *_ in self._get_visual_extents(v):
                     fwd_sum += np.dot(origin, cam_fwd)
                     fwd_cnt += 1
@@ -616,11 +623,39 @@ class Scene:
             return position, target, ortho_size
 
         for tl_stage in self.timeline.stages:
-            pos, tgt, osz = compute_framing(tl_stage.stage_name)
+            sname = tl_stage.stage_name
+            stage = self.stages[sname]
+            num_groups = stage._get_num_groups()
 
-            t_arrive = tl_stage.start_time + tl_stage.appear_duration * 0.5
-            self.camera.add_waypoint(t_arrive, pos, tgt, osz)
-            self.camera.add_waypoint(tl_stage.end_time, pos, tgt, osz)
+            if num_groups <= 1:
+                # Single group: one framing for the whole stage
+                pos, tgt, osz = compute_framing(sname)
+                t_arrive = tl_stage.start_time + tl_stage.appear_duration * 0.5
+                self.camera.add_waypoint(t_arrive, pos, tgt, osz)
+                self.camera.add_waypoint(tl_stage.end_time, pos, tgt, osz)
+            else:
+                # Multi-group: camera reframes per operation
+                t_compute = tl_stage.start_time + tl_stage.appear_duration
+                compute_dur = tl_stage.compute_duration
+
+                # Appear phase → frame group 0
+                pos, tgt, osz = compute_framing(sname, group=0)
+                t_arrive = tl_stage.start_time + tl_stage.appear_duration * 0.5
+                self.camera.add_waypoint(t_arrive, pos, tgt, osz)
+
+                for gi, (seg_s, seg_e) in enumerate(stage.group_segments):
+                    seg_t = t_compute + seg_s * compute_dur
+                    seg_t_end = t_compute + seg_e * compute_dur
+                    seg_dur = (seg_e - seg_s) * compute_dur
+
+                    pos, tgt, osz = compute_framing(sname, group=gi)
+                    # Transition in the first 30% of the segment (during appear)
+                    t_arrive = seg_t + min(seg_dur * 0.3, 0.8)
+                    self.camera.add_waypoint(t_arrive, pos, tgt, osz)
+                    self.camera.add_waypoint(seg_t_end, pos, tgt, osz)
+
+                # Settle: hold last group's framing
+                self.camera.add_waypoint(tl_stage.end_time, pos, tgt, osz)
 
         first_pos, first_tgt, first_osz = compute_framing(
             self.timeline.stages[0].stage_name)
@@ -756,6 +791,9 @@ class Scene:
         aspect = fb_w / max(fb_h, 1)
         proj = self.camera.get_projection_matrix(aspect)
 
+        # Scale labels with camera zoom so they stay readable when zoomed out
+        char_height = 0.75 * (self.camera.ortho_size / 10.0)
+
         for stage_name, stage in self.stages.items():
             if stage.alpha < 0.01:
                 continue
@@ -766,7 +804,7 @@ class Scene:
 
                 text_renderer.render_text_3d(
                     text, world_pos, view, proj,
-                    char_height=0.75,
+                    char_height=char_height,
                     color=(1.0, 1.0, 1.0, label_alpha * 0.9))
 
     def update(self, dt: float):
@@ -850,6 +888,7 @@ class Scene:
                         for v in stage.visuals:
                             g = getattr(v, 'phase_group', 0)
                             if g < max_started:
+                                v.alpha = 0.0
                                 v.output_alpha_mult = 0.0
                                 # Smooth label crossfade based on next group's
                                 # appear progress (first 20% of its segment)
@@ -878,9 +917,8 @@ class Scene:
                 for v in stage.visuals:
                     if v.is_stage_output:
                         v.output_alpha_mult = 0.0
-                        v.alpha = fade
-                    else:
-                        v.alpha = fade
+                    # min() preserves alpha=0 from in-place takeover
+                    v.alpha = min(v.alpha, fade)
 
         # Return-to-start: fade all stages out
         if self.timeline.current_time > self.timeline.total_duration:

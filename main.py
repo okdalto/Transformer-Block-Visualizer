@@ -60,7 +60,7 @@ def setup(args):
     text_renderer = TextRenderer(
         os.path.join(base_dir, "shaders", "text.vert"),
         os.path.join(base_dir, "shaders", "text.frag"),
-        font_size=54,
+        font_size=44,
     )
     label_renderer = TextRenderer(
         os.path.join(base_dir, "shaders", "text.vert"),

@@ -377,9 +377,8 @@ class TextRenderer:
         display_name = STAGE_DISPLAY_NAMES.get(stage_name, stage_name)
         text_width = self._measure_text(display_name)
 
-        padding = 20
-        x = fb_width - text_width - padding
-        y = padding
+        x = fb_width - text_width - 26
+        y = 26
 
         # Semi-transparent dark background
         bg_x = x - 10

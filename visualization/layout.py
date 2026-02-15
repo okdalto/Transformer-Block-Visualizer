@@ -8,7 +8,7 @@ SPACING = 0.5  # box_size(0.4) + gap(0.1)
 MATRIX_X_GAP = 2.0        # default horizontal gap between side-by-side matrices
 MHA_MATMUL_X_GAP = 2.0    # horizontal gap for MHA matmul sub-ops
 QKV_STACK_Y_GAP = 2.0     # vertical gap for Q, K, V projection stacking
-MHA_HEAD_Y_GAP = 4.0      # vertical gap between attention heads
+MHA_HEAD_Y_GAP = 3.5      # vertical gap between attention heads
 
 # Z-axis offsets within a matmul group (A at base, C in front, B behind)
 MATMUL_Z_C = 2.0          # result matrix Z offset from A
