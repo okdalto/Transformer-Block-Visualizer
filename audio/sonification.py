@@ -445,10 +445,7 @@ def build_soundtrack(results, config):
                     all_events += events_relu(
                         results['ffn_pre_relu'], results['ffn_hidden'],
                         seg_t, seg_dur)
-                elif gi == 2:
-                    all_events += events_matmul(
-                        results['ffn_hidden'], results['W2'],
-                        results['ffn_output'], seg_t, seg_dur)
+                # gi == 2 (W2 matmul): intentionally silent
 
         # ── Residual + LayerNorm 2 ──
         elif name == 'residual_ln2':
