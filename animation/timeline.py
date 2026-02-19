@@ -89,7 +89,7 @@ LOGITS_ONLY_SPEED = {
     'block_3':            {'appear': 6.0, 'settle': 3.0},
     'block_4':            {'appear': 6.0, 'settle': 3.0},
     'output_projection':  {'appear': 6.0, 'settle': 3.0},
-    'token_probs':        {'appear': 6.0},
+    'token_probs':        {'appear': 6.0, 'settle': 3.0, 'compute': [6.0, 6.0, 6.0]},
 }
 
 

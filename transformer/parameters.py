@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class TransformerConfig:
     d_model: int = 16
-    seq_len: int = 16
+    seq_len: int = 12
     num_heads: int = 4
     d_k: int = 4        # d_model // num_heads
     d_ff: int = 128      # Feed-forward hidden dimension

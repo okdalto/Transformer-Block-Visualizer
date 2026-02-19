@@ -30,6 +30,8 @@ def parse_args():
                         help="Recording FPS (default: 30)")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="Animation speed multiplier for recording (default: 1.0)")
+    parser.add_argument("--max-duration", type=float, default=180.0,
+                        help="Maximum recording duration in seconds (default: 180 = 3 min)")
     parser.add_argument("--width", type=int, default=1920,
                         help="Recording width (default: 1920)")
     parser.add_argument("--height", type=int, default=1080,
@@ -387,7 +389,6 @@ def run_record(args):
     ext = args.format
     save_kwargs = {"quality": 95} if ext == "jpg" else {}
     fb_w, fb_h = fbo['w'], fbo['h']
-    sim_dt = args.speed / args.fps
     aspect = args.width / max(args.height, 1)
     renderer = scene.renderer
 
@@ -414,18 +415,28 @@ def run_record(args):
         scenes.append(scene)
 
     # Calculate per-step frame counts
+    # Auto-scale speed to fit within max duration (default 3 min)
+    raw_durations = []
+    for s in scenes:
+        raw_durations.append(s.timeline.total_duration + s.timeline.return_duration)
+    raw_total = sum(raw_durations)
+
+    speed = args.speed
+    if args.max_duration and raw_total / speed > args.max_duration:
+        speed = raw_total / args.max_duration
+    sim_dt = speed / args.fps
+
     step_infos = []
     total_frames = 0
-    for s in scenes:
-        dur = s.timeline.total_duration + s.timeline.return_duration
-        nf = int(dur * args.fps / args.speed)
-        step_infos.append((s, dur, nf))
+    for s, raw_dur in zip(scenes, raw_durations):
+        nf = int(raw_dur * args.fps / speed)
+        step_infos.append((s, raw_dur, nf))
         total_frames += nf
 
-    total_duration = sum(dur for _, dur, _ in step_infos)
-    print(f"=== Recording: {total_frames} frames @ {args.fps}fps (speed={args.speed}x) ===")
+    output_duration = sum(dur / speed for dur in raw_durations)
+    print(f"=== Recording: {total_frames} frames @ {args.fps}fps (speed={speed:.2f}x) ===")
     print(f"  Steps    : {len(scenes)}")
-    print(f"  Duration : {total_duration:.1f}s total")
+    print(f"  Timeline : {raw_total:.1f}s → {output_duration:.1f}s output")
     for si, (s, dur, nf) in enumerate(step_infos):
         mode = "full" if si == 0 else ("final" if si == len(scenes) - 1 else "logits")
         print(f"    Step {si+1}: {dur:.1f}s ({nf} frames, {mode})")
@@ -489,7 +500,7 @@ def run_record(args):
     for si, (s, dur, nf) in enumerate(step_infos):
         print(f"  Step {si+1}/{len(scenes)}:")
         part = build_soundtrack(s.results, config, timeline=s.timeline,
-                               logits_only=s.logits_only)
+                               logits_only=s.logits_only, time_scale=speed)
         audio_parts.append(part)
     audio = np.concatenate(audio_parts, axis=0)
     wav_path = os.path.join(out_dir, "soundtrack.wav")

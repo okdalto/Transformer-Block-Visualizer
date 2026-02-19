@@ -404,25 +404,32 @@ def _compress(x, threshold=0.12, ratio=4.0, attack_s=0.005, release_s=0.08):
 
 # ─── Main Composition ───────────────────────────────────────────────
 
-def build_soundtrack(results, config, timeline=None, logits_only=False):
-    """Build the complete data sonification soundtrack from transformer events."""
+def build_soundtrack(results, config, timeline=None, logits_only=False,
+                     time_scale=1.0):
+    """Build the complete data sonification soundtrack from transformer events.
+
+    time_scale: speed multiplier (>1 compresses audio to fit shorter duration).
+    """
     if timeline is None:
         timeline = AnimationTimeline()
-    total_duration = timeline.total_duration + timeline.return_duration
+    raw_duration = timeline.total_duration + timeline.return_duration
+    total_duration = raw_duration / time_scale
     total_samples = int(total_duration * SR)
 
     print(f"  Timeline: {timeline.total_duration:.1f}s + "
-          f"{timeline.return_duration:.1f}s return = {total_duration:.1f}s")
+          f"{timeline.return_duration:.1f}s return = {raw_duration:.1f}s"
+          + (f" (x{time_scale:.2f} → {total_duration:.1f}s)" if time_scale != 1.0 else ""))
     print(f"  Samples: {total_samples} @ {SR}Hz")
     print()
 
+    ts = time_scale  # shorthand
     all_events = []
 
     for stage in timeline.stages:
         name = stage.stage_name
-        t0 = stage.start_time
-        appear_dur = stage.appear_duration
-        compute_dur = stage.compute_duration
+        t0 = stage.start_time / ts
+        appear_dur = stage.appear_duration / ts
+        compute_dur = stage.compute_duration / ts
         t_appear = t0
         t_compute = t0 + appear_dur
 
